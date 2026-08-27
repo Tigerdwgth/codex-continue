@@ -329,6 +329,48 @@ test('scan：普通终端 codex 用写 tty 发送', () => {
   assert.deepStrictEqual(writes, [{ dev: '/dev/ttys200', data: 'continue' }, { dev: '/dev/ttys200', data: '\n' }]);
 });
 
+test('scan：进程在错误之后启动（用户 resume 会话）→ 不自动 continue', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
+
+  const writes = [];
+  const scanner = createScanner({
+    // 进程 11:31 启动，错误 11:30 → 进程在错误之后启动（resume 场景）
+    execPs: () => ` 1000 Wed Aug 26 11:31:00 2026 ttys011 codex resume 01a04000-0000-0000-0000-000000000003\n`,
+    execTmux: () => '',
+    now: () => ERR_TS + 120_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 0, 'resume 场景不自动 continue');
+  assert.strictEqual(writes.length, 0);
+});
+
+test('scan：进程在错误之前就在运行（一直卡住）→ 正常触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
+
+  const writes = [];
+  const scanner = createScanner({
+    // 进程 10:00 启动，错误 11:30 → 进程在错误前就在运行
+    execPs: () => ` 1000 Wed Aug 26 10:00:00 2026 ttys011 codex\n`,
+    execTmux: () => '',
+    now: () => ERR_TS + 60_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1);
+  assert.strictEqual(writes.length, 2);
+});
+
 test('scan：进程消失后状态清理', () => {
   const { readdirSync, statSync, readFileSync } = makeDirTree();
   let ps = ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`;
