@@ -1,138 +1,184 @@
 'use strict';
-// test/scan.test.js
+// test/scan.test.js — codex-continue 核心测试（ps 扫描 + 会话日志检测 + 写 tty）
 const test = require('node:test');
 const assert = require('node:assert');
-const { createScanner, hashText, listCodexPanes, DEFAULT_SEND } = require('../lib/scan');
+const {
+  createScanner, listCodexProcesses, findSessionLog, detectError, parseLstart,
+} = require('../lib/scan');
 
-// 注入式 tmux 执行器：按参数返回假输出，send-keys 记录到 calls。
-// panes 元素可以是字符串（视为 codex pane）或 { target, cmd }。
-function makeEnv({ panes, captureText }) {
-  const sends = [];
-  let captureCall = 0;
-  const exec = (args) => {
-    if (args[0] === 'list-panes') {
-      return panes
-        .map((p) => (typeof p === 'string' ? { target: p, cmd: 'codex' } : p))
-        .map((p) => `${p.target}\t${p.cmd}`)
-        .join('\n');
+const PS_SAMPLE = `  PID LSTART TTY  COMMAND
+ 18548 Wed Aug 26 22:18:16 2026 ttys011 codex
+ 39018 Mon Aug 24 10:00:00 2026 ttys018 codex resume 01a04000-0000-0000-0000-000000000001
+  1134 Mon Aug 24 04:00:00 2026 ??     /Users/gsj/.vscode/extensions/openai.chatgpt/bin/macos-aarch64/codex -c features.code_mode_host=true app-server
+ 26463 Tue Aug 25 08:00:00 2026 ttys025 codex resume 01a04000-0000-0000-0000-000000000002
+  6691 Mon Aug 24 05:00:00 2026 ??     /Users/gsj/.vscode-server/extensions/openai.chatgpt/bin/macos-aarch64/codex-code-mode-host
+ 94051 Tue Aug 25 20:00:00 2026 ttys022 codex
+`;
+
+test('listCodexProcesses 解析 ps，只留交互式 codex', () => {
+  const procs = listCodexProcesses(() => PS_SAMPLE);
+  assert.strictEqual(procs.length, 4);
+  const tui = procs.find((p) => p.pid === 18548);
+  assert.strictEqual(tui.tty, 'ttys011');
+  assert.strictEqual(tui.sessionId, null);
+  const resume = procs.find((p) => p.pid === 39018);
+  assert.strictEqual(resume.sessionId, '01a04000-0000-0000-0000-000000000001');
+  // code-mode-host / app-server / 无 tty 都被排除
+  assert.ok(!procs.some((p) => p.command.includes('code-mode-host')));
+  assert.ok(!procs.some((p) => p.tty === '??'));
+});
+
+test('parseLstart 解析 macOS ps lstart 格式', () => {
+  const t = parseLstart('Wed Aug 26 22:18:16 2026');
+  const d = new Date(t);
+  assert.strictEqual(d.getFullYear(), 2026);
+  assert.strictEqual(d.getMonth(), 7); // Aug
+  assert.strictEqual(d.getDate(), 26);
+  assert.strictEqual(d.getHours(), 22);
+  assert.ok(Number.isFinite(t));
+  assert.strictEqual(parseLstart('garbage'), null);
+});
+
+function makeDirTree() {
+  // ~/.codex/sessions/2026/08/26/<rollout>.jsonl 的目录结构 mock
+  const T = (h) => new Date(2026, 7, 26, h, 0, 0).getTime(); // 2026-08-26 本地时间
+  const files = new Map(); // path → { size, content, mtimeMs }
+  const set = (p, content, mtimeMs) => files.set(p, { size: Buffer.byteLength(content), content, mtimeMs });
+  const ROOT = '/fake/.codex/sessions';
+  set(`${ROOT}/2026/08/26/rollout-2026-08-26T00-00-00-01a04000-0000-0000-0000-000000000001.jsonl`, '', T(8));
+  set(`${ROOT}/2026/08/26/rollout-2026-08-26T10-00-00-01a04000-0000-0000-0000-000000000002.jsonl`, '', T(10));
+  set(`${ROOT}/2026/08/26/rollout-2026-08-26T12-00-00-01a04000-0000-0000-0000-000000000003.jsonl`, '', T(12));
+
+  const readdirSync = (dir, opts) => {
+    const children = [];
+    for (const p of files.keys()) {
+      const rel = p.slice(ROOT.length + 1);
+      if (path.dirname(rel) === path.relative(ROOT, dir) || (dir === ROOT && !rel.includes('/'))) {
+        const base = path.basename(p);
+        if (dir === ROOT) children.push({ name: base, isDirectory: () => true, isFile: () => false });
+      }
     }
-    if (args[0] === 'capture-pane') {
-      return typeof captureText === 'function' ? captureText(captureCall++) : captureText;
+    // 简化：直接按层级返回
+    if (dir === ROOT) return ['2026'].map((n) => ({ name: n, isDirectory: () => true, isFile: () => false }));
+    if (dir.endsWith('2026')) return ['08'].map((n) => ({ name: n, isDirectory: () => true, isFile: () => false }));
+    if (dir.endsWith('08')) return ['26'].map((n) => ({ name: n, isDirectory: () => true, isFile: () => false }));
+    if (dir.endsWith('26')) {
+      return [...files.keys()].filter((p) => path.dirname(p) === dir).map((p) => ({ name: path.basename(p), isDirectory: () => false, isFile: () => true }));
     }
-    if (args[0] === 'send-keys') {
-      sends.push(args); // ['send-keys','-t',target,send,'Enter']
-      return '';
-    }
-    return '';
+    return [];
   };
-  return { exec, sends };
+  const statSync = (p) => ({ size: files.get(p)?.size || 0, mtimeMs: files.get(p)?.mtimeMs || 0 });
+  const readFileSync = (p, opts) => {
+    const f = files.get(p);
+    if (!f) return '';
+    const { start = 0, end = f.size } = opts || {};
+    return f.content.slice(start, end);
+  };
+  return { readdirSync, statSync, readFileSync, files, ROOT };
 }
 
-function nowStub(start = 0) {
-  const t = { value: start };
-  return { now: () => t.value, t };
-}
+const path = require('node:path');
 
-test('listCodexPanes 返回 codex pane target', () => {
-  const { exec } = makeEnv({ panes: ['sess:0.0', 'sess:1.2'] });
-  assert.deepStrictEqual(listCodexPanes(exec), ['sess:0.0', 'sess:1.2']);
+test('findSessionLog：resume 按 session id 匹配；普通按启动时间最近', () => {
+  const { readdirSync, statSync, files, ROOT } = makeDirTree();
+  const allLogs = [{ path: `${ROOT}/2026/08/26/rollout-x-01a04000-0000-0000-0000-000000000001.jsonl`, mtimeMs: 1 }, { path: `${ROOT}/2026/08/26/rollout-y-01a04000-0000-0000-0000-000000000002.jsonl`, mtimeMs: 2 }];
+  const assigned = new Set();
+  const resumeProc = { sessionId: '01a04000-0000-0000-0000-000000000002', startTimeMs: 0 };
+  const hit = findSessionLog(resumeProc, allLogs, assigned);
+  assert.ok(hit.path.includes('000000000002'));
 });
 
-test('命中 "model at capacity" → 发送 continue + Enter', () => {
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: 'ERROR: model at capacity\n' });
-  const scanner = createScanner({ exec });
-  assert.strictEqual(scanner.scan(), 1);
-  assert.deepStrictEqual(sends[0], ['send-keys', '-t', 'codex:0.0', DEFAULT_SEND, 'Enter']);
+test('detectError 只检测增量增长部分，命中 429 / capacity', () => {
+  const logPath = '/fake/rollout.jsonl';
+  const size = Buffer.byteLength('first\n' + 'exceeded retry limit, last status: 429 Too Many Requests\n');
+  const statSync = () => ({ size });
+  const readFileSync = (p, o) => 'exceeded retry limit, last status: 429 Too Many Requests\n';
+  const { hit, newSize } = detectError(logPath, 0, [/model at capacity/i, /exceeded retry limit, last status: 429 too many requests/i], readFileSync, statSync);
+  assert.strictEqual(hit, true);
+  assert.strictEqual(newSize, size);
 });
 
-test('命中 429 "exceeded retry limit" → 触发', () => {
-  const { exec, sends } = makeEnv({
-    panes: ['codex:0.0'],
-    captureText: 'exceeded retry limit, last status: 429 Too Many Requests, request id: abc\n',
+test('scan 全流程：ps 找到 codex → 日志有错误 → 写 tty continue + \\r', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/rollout-2026-08-26T12-00-00-01a04000-0000-0000-0000-000000000003.jsonl`;
+  const errContent = '{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests, request id: abc"}}}\n';
+  files.set(errLog, { size: Buffer.byteLength(errContent), content: errContent, mtimeMs: new Date(2026, 7, 26, 12, 0, 0).getTime() });
+
+  const writes = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    sessionsDir: '/fake/.codex/sessions',
+    io: {
+      readdirSync, statSync, readFileSync,
+      writeFileSync: (dev, data) => writes.push({ dev, data }),
+    },
+    cooldownMs: 30000,
+    enterDelayMs: 0,
   });
-  const scanner = createScanner({ exec });
-  assert.strictEqual(scanner.scan(), 1);
-  assert.strictEqual(sends.length, 1);
+  const n = scanner.scan();
+  assert.strictEqual(n, 1);
+  assert.strictEqual(writes.length, 2);
+  assert.strictEqual(writes[0].dev, '/dev/ttys011');
+  assert.strictEqual(writes[0].data, 'continue');
+  assert.strictEqual(writes[1].data, '\r');
 });
 
-test('同一屏错误不重复触发（指纹去重）', () => {
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: () => 'ERROR: model at capacity\n' });
-  const scanner = createScanner({ exec });
-  scanner.scan();
-  scanner.scan();
-  scanner.scan();
-  assert.strictEqual(sends.length, 1);
-});
-
-test('屏幕变化但冷却期内 → 不重复；冷却过后屏幕再变 → 恢复', () => {
-  let n = 0;
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: () => `ERROR: model at capacity [${n++}]\n` });
-  const { now, t } = nowStub(0);
-  const scanner = createScanner({ exec, now, cooldownMs: 30000 });
-  scanner.scan(); // t=0 触发
-  assert.strictEqual(sends.length, 1);
-  t.value += 5000;
-  scanner.scan(); // 冷却期
-  assert.strictEqual(sends.length, 1);
-  t.value += 40000;
-  scanner.scan(); // 冷却过，屏幕已变 → 触发
-  assert.strictEqual(sends.length, 2);
-});
-
-test('错误消失又出现 → 可以再次触发', () => {
-  const texts = ['ERROR: model at capacity\n', 'prompt> ok\n', 'ERROR: model at capacity again\n'];
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: () => texts.shift() || '' });
-  const { now, t } = nowStub(0);
-  const scanner = createScanner({ exec, now, cooldownMs: 30000 });
-  scanner.scan(); // 命中
-  t.value += 5000;
-  scanner.scan(); // 无错误
-  assert.strictEqual(sends.length, 1);
-  t.value += 40000;
-  scanner.scan(); // 错误再现 → 再触发
-  assert.strictEqual(sends.length, 2);
-});
-
-test('无关输出不触发', () => {
-  const { exec, sends } = makeEnv({
-    panes: ['codex:0.0'],
-    captureText: 'some normal log\nHTTP 500 Error\n',
+test('scan：日志无新错误时不触发', () => {
+  const { readdirSync, statSync, readFileSync } = makeDirTree();
+  const writes = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
   });
-  const scanner = createScanner({ exec });
   assert.strictEqual(scanner.scan(), 0);
-  assert.strictEqual(sends.length, 0);
+  assert.strictEqual(writes.length, 0);
 });
 
-test('跨 chunk 拆分错误文本仍命中（尾部缓冲）', () => {
-  const parts = ['exceeded retry ', 'limit, last status: 429 Too ', 'Many Requests, request id: x'];
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: () => parts.shift() || '' });
-  const scanner = createScanner({ exec });
+test('scan：错误不再增长不重复触发；冷却内新错误也不触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/rollout-2026-08-26T12-00-00-01a04000-0000-0000-0000-000000000003.jsonl`;
+  const errContent = '{"payload":{"type":"task_complete","error":{"message":"model at capacity"}}}\n';
+  files.set(errLog, { size: Buffer.byteLength(errContent), content: errContent, mtimeMs: new Date(2026, 7, 26, 12, 0, 0).getTime() });
+
+  const writes = [];
+  const t = { value: 0 };
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => t.value,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  scanner.scan(); // 触发
+  assert.strictEqual(writes.length, 2);
+  scanner.scan(); // 日志没变，不重复
+  assert.strictEqual(writes.length, 2);
+  // 日志增长出新错误但冷却内 → 不触发，但 lastSize 前进
+  const err2 = errContent + '{"payload":{"type":"task_complete","error":{"message":"model at capacity"}}}\n';
+  files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: new Date(2026, 7, 26, 12, 0, 10).getTime() });
+  t.value = 5000;
   scanner.scan();
+  assert.strictEqual(writes.length, 2, '冷却内不触发');
+  // 冷却过后日志再出现新错误 → 触发
+  const err3 = err2 + '{"payload":{"type":"task_complete","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests, request id: zzz"}}}\n';
+  files.set(errLog, { size: Buffer.byteLength(err3), content: err3, mtimeMs: new Date(2026, 7, 26, 12, 0, 20).getTime() });
+  t.value = 40000;
   scanner.scan();
-  scanner.scan();
-  assert.strictEqual(sends.length, 1, '三次累计后尾部缓冲应命中');
+  assert.strictEqual(writes.length, 4, '冷却过后新错误触发');
 });
 
-test('自定义 send 文本生效', () => {
-  const { exec, sends } = makeEnv({ panes: ['codex:0.0'], captureText: 'ERROR: model at capacity\n' });
-  const scanner = createScanner({ exec, send: '继续' });
+test('scan：进程消失后状态清理', () => {
+  const { readdirSync, statSync, readFileSync } = makeDirTree();
+  let ps = ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`;
+  const scanner = createScanner({
+    execPs: () => ps,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: () => {} },
+  });
   scanner.scan();
-  assert.deepStrictEqual(sends[0], ['send-keys', '-t', 'codex:0.0', '继续', 'Enter']);
-});
-
-test('pane 消失后状态被清理', () => {
-  const panes = ['codex:0.0'];
-  const { exec } = makeEnv({ panes, captureText: '' });
-  const scanner = createScanner({ exec });
+  ps = ` 2000 Wed Aug 26 20:00:00 2026 ttys011 zsh\n`; // codex 退出了
   scanner.scan();
-  assert.strictEqual(scanner.listCodexPanes().length, 1);
-  // 模拟该 pane 退出，换成非 codex pane
-  panes.length = 0;
-  panes.push({ target: 'sess:0.0', cmd: 'zsh' });
-  scanner.scan();
-  assert.strictEqual(scanner.listCodexPanes().length, 0);
-});
-
-test('hashText 忽略 ANSI 控制序列', () => {
-  assert.strictEqual(hashText('\x1b[31mERROR\x1b[0m: model at capacity'), hashText('ERROR: model at capacity'));
+  assert.strictEqual(scanner.listCodexProcesses().length, 0);
 });
