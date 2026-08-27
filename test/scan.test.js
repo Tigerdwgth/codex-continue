@@ -120,7 +120,7 @@ test('scan 全流程：ps 找到 codex → 日志有错误 → 写 tty continue 
   assert.strictEqual(writes.length, 2);
   assert.strictEqual(writes[0].dev, '/dev/ttys011');
   assert.strictEqual(writes[0].data, 'continue');
-  assert.strictEqual(writes[1].data, '\r');
+  assert.strictEqual(writes[1].data, '\n');
 });
 
 test('scan：日志无新错误时不触发', () => {
