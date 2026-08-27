@@ -1,0 +1,19 @@
+{
+  "name": "codex-continue",
+  "version": "0.1.0",
+  "description": "Auto-continue stuck codex sessions: periodically scan all codex sessions (tmux panes) and send continue on model-capacity / 429 rate-limit errors.",
+  "bin": {
+    "codex-continue": "bin/codex-continue.js"
+  },
+  "main": "lib/scan.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": ["codex", "rate-limit", "429", "model-at-capacity", "tmux", "auto-continue", "whip"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": ["bin/", "lib/"]
+}
