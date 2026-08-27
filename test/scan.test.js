@@ -371,6 +371,48 @@ test('scan：进程在错误之前就在运行（一直卡住）→ 正常触发
   assert.strictEqual(writes.length, 2);
 });
 
+test('scan：错误之后已有新活动（会话已恢复）→ 不触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  // 错误之后还有普通事件（agent_message），说明会话在错误后继续了
+  const content = errLine(BASE) + '{"timestamp":"' + new Date(BASE + 60_000).toISOString() + '","type":"event_msg","payload":{"type":"agent_message","message":{"content":"working..."}}}\n';
+  files.set(errLog, { size: Buffer.byteLength(content), content, mtimeMs: BASE + 60_000 });
+
+  const writes = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 10:00:00 2026 ttys011 codex\n`,
+    execTmux: () => '',
+    now: () => BASE + 120_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 0, '错误后已恢复的会话不触发');
+  assert.strictEqual(writes.length, 0);
+});
+
+test('scan：错误是最后一条（会话停在错误上）→ 触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(BASE)), content: errLine(BASE), mtimeMs: BASE });
+
+  const writes = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 10:00:00 2026 ttys011 codex\n`,
+    execTmux: () => '',
+    now: () => BASE + 60_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1, '停在错误上的会话触发');
+  assert.strictEqual(writes.length, 2);
+});
+
 test('scan：进程消失后状态清理', () => {
   const { readdirSync, statSync, readFileSync } = makeDirTree();
   let ps = ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`;
