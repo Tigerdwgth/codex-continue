@@ -103,6 +103,18 @@ test('detectError 无法解析 timestamp 的错误行不计（避免误触发）
   assert.strictEqual(hit, false);
 });
 
+test('detectError 忽略普通消息行（agent_message 文本提到关键词不算错误）', () => {
+  const ts = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  const content = JSON.stringify({
+    timestamp: new Date(ts).toISOString(), type: 'event_msg',
+    payload: { type: 'agent_message', message: { content: 'user said: model at capacity is a common issue' } },
+  }) + '\n';
+  const statSync = () => ({ size: Buffer.byteLength(content) });
+  const readFileSync = () => content;
+  const { hit } = detectError(logPath(), 0, [/model at capacity/i], readFileSync, statSync);
+  assert.strictEqual(hit, false, 'agent_message 不应算错误');
+});
+
 test('scan 全流程：窗口内错误 → 写 tty continue + \\n', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
