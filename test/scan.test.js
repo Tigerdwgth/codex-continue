@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  createScanner, listCodexProcesses, findSessionLog, detectError, parseLstart,
+  createScanner, listCodexProcesses, findSessionLog, detectError, parseLstart, listTmuxPaneTargets,
 } = require('../lib/scan');
 
 const PS_SAMPLE = `  PID LSTART TTY  COMMAND
@@ -122,7 +122,7 @@ test('scan 全流程：窗口内错误 → 写 tty continue + \\n', () => {
   files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
 
   const writes = [];
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => ERR_TS + 60_000, // 错误后 1 分钟，窗口内
     cooldownMs: 30000,
@@ -144,7 +144,7 @@ test('scan：历史错误（超过窗口）不触发 —— 没报错不再发 c
   files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
 
   const writes = [];
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => ERR_TS + 20 * 60_000, // 错误后 20 分钟，超过窗口
     cooldownMs: 30000,
@@ -159,7 +159,7 @@ test('scan：历史错误（超过窗口）不触发 —— 没报错不再发 c
 test('scan：日志无错误时不触发', () => {
   const { readdirSync, statSync, readFileSync } = makeDirTree();
   const writes = [];
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
@@ -177,7 +177,7 @@ test('scan：错误不再增长不重复触发；冷却内新错误也不触发'
 
   const writes = [];
   const t = { value: BASE + 60_000 };
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => t.value,
     cooldownMs: 30000,
@@ -212,7 +212,7 @@ test('scan：发送后日志增长（codex 响应）→ 正常，不静默', () 
 
   const writes = [];
   const t = { value: BASE + 60_000 };
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => t.value,
     cooldownMs: 30000,
@@ -244,7 +244,7 @@ test('scan：发送后日志不增长（codex 冻结/无响应）→ 静默跳�
 
   const writes = [];
   const t = { value: BASE + 60_000 };
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => t.value,
     cooldownMs: 30000,
@@ -268,10 +268,71 @@ test('scan：发送后日志不增长（codex 冻结/无响应）→ 静默跳�
   assert.strictEqual(writes.length, 2, '静默期内不发');
 });
 
+test('listTmuxPaneTargets 解析 pane_tty → target 映射', () => {
+  const map = listTmuxPaneTargets(() => '/dev/ttys011\tS-lo-t-SIM:0.0\n/dev/ttys019\tcc-x:0.0\n');
+  assert.strictEqual(map.get('/dev/ttys011'), 'S-lo-t-SIM:0.0');
+  assert.strictEqual(map.get('/dev/ttys019'), 'cc-x:0.0');
+});
+
+test('listCodexProcesses：tmux 里的 codex 标注 tmuxTarget，普通终端为 null', () => {
+  const psOut = ' 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n 2000 Wed Aug 26 11:00:00 2026 ttys200 codex\n';
+  const map = new Map([['/dev/ttys011', 'S-lo-t-SIM:0.0']]);
+  const procs = listCodexProcesses(() => psOut, map);
+  const a = procs.find((p) => p.pid === 1000);
+  const b = procs.find((p) => p.pid === 2000);
+  assert.strictEqual(a.tmuxTarget, 'S-lo-t-SIM:0.0');
+  assert.strictEqual(b.tmuxTarget, null);
+});
+
+test('scan：tmux 里的 codex 用 tmux send-keys 发送（文本 + Enter 分两次）', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
+
+  const tmuxCmds = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tS-lo-t-SIM:0.0\n';
+      if (args[0] === 'send-keys') { tmuxCmds.push(args); return ''; }
+      return '';
+    },
+    now: () => ERR_TS + 60_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: () => { throw new Error('不应写 tty'); } },
+  });
+  assert.strictEqual(scanner.scan(), 1);
+  assert.deepStrictEqual(tmuxCmds[0], ['send-keys', '-t', 'S-lo-t-SIM:0.0', 'continue']);
+  assert.deepStrictEqual(tmuxCmds[1], ['send-keys', '-t', 'S-lo-t-SIM:0.0', 'Enter']);
+});
+
+test('scan：普通终端 codex 用写 tty 发送', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(ERR_TS)), content: errLine(ERR_TS), mtimeMs: ERR_TS });
+
+  const writes = [];
+  const scanner = createScanner({
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys200 codex\n`,
+    execTmux: () => '', // 无 tmux 映射 → 普通终端
+    now: () => ERR_TS + 60_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (dev, data) => writes.push({ dev, data }) },
+  });
+  assert.strictEqual(scanner.scan(), 1);
+  assert.deepStrictEqual(writes, [{ dev: '/dev/ttys200', data: 'continue' }, { dev: '/dev/ttys200', data: '\n' }]);
+});
+
 test('scan：进程消失后状态清理', () => {
   const { readdirSync, statSync, readFileSync } = makeDirTree();
   let ps = ` 1000 Wed Aug 26 20:00:00 2026 ttys011 codex\n`;
-  const scanner = createScanner({
+  const scanner = createScanner({ execTmux: () => '',
     execPs: () => ps,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: () => {} },
