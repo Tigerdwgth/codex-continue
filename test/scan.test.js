@@ -482,3 +482,31 @@ test('scan：日志活跃（mtime 新鲜，codex 在写）→ 即使有 429 也�
   assert.strictEqual(scanner.scan(), 0, '活跃中的会话（日志在写）不触发');
   assert.strictEqual(writes.length, 0);
 });
+
+test('scan：tmux 屏幕实时显示 429（日志无记录）→ 触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  // 日志里没有任何 429（codex 只显示在 TUI 上不写日志）
+  files.set(errLog, { size: Buffer.byteLength('{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n'), content: '{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n', mtimeMs: BASE });
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n'; // ttys011 → codex:0.0
+      if (args[0] === 'capture-pane') return '\n\x1b[31m■ exceeded retry limit, last status: 429 Too Many Requests\x1b[0m\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE + 600_000, // 日志停滞很久
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1, '屏幕有 429 即使日志无记录也触发');
+  assert.strictEqual(sends.length, 2, 'tmux send-keys 发 continue + Enter');
+  assert.ok(sends[0].includes('continue'), '发 continue');
+  assert.ok(sends[1].includes('Enter'), '发 Enter');
+});
