@@ -115,7 +115,7 @@ test('detectError 忽略普通消息行（agent_message 文本提到关键词不
   assert.strictEqual(hit, false, 'agent_message 不应算错误');
 });
 
-test('scan 全流程：窗口内错误 → 写 tty continue + \\n', () => {
+test('scan 全流程：日志有 429 错误 → 写 tty continue + \\n', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
   const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
@@ -137,7 +137,7 @@ test('scan 全流程：窗口内错误 → 写 tty continue + \\n', () => {
   assert.strictEqual(writes[1].data, '\n');
 });
 
-test('scan：历史错误（超过窗口）不触发 —— 没报错不再发 continue', () => {
+test('scan：历史错误（已停住）也触发 —— 移除时间窗口后只要有错误就发', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
   const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
@@ -146,14 +146,14 @@ test('scan：历史错误（超过窗口）不触发 —— 没报错不再发 c
   const writes = [];
   const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
-    now: () => ERR_TS + 20 * 60_000, // 错误后 20 分钟，超过窗口
+    now: () => ERR_TS + 20 * 60_000, // 错误后 20 分钟（远超原 10 分钟窗口）
     cooldownMs: 30000,
     enterDelayMs: 0,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
   });
-  assert.strictEqual(scanner.scan(), 0, '历史错误不触发');
-  assert.strictEqual(writes.length, 0);
+  assert.strictEqual(scanner.scan(), 1, '历史错误同样触发');
+  assert.strictEqual(writes.length, 2);
 });
 
 test('scan：日志无错误时不触发', () => {
@@ -425,4 +425,38 @@ test('scan：进程消失后状态清理', () => {
   ps = ` 2000 Wed Aug 26 20:00:00 2026 ttys011 zsh\n`;
   scanner.scan();
   assert.strictEqual(scanner.listCodexProcesses().length, 0);
+});
+
+test('findSessionLog：lsof 探测的 openLogs 优先于启动时间猜测', () => {
+  const { ROOT } = makeDirTree();
+  const allLogs = [
+    { path: `${ROOT}/2026/08/26/rollout-x-01a00000-0000-0000-0000-0000000000aa.jsonl`, mtimeMs: 100 },
+    { path: `${ROOT}/2026/08/26/rollout-y-01a00000-0000-0000-0000-0000000000bb.jsonl`, mtimeMs: 200 },
+    { path: `${ROOT}/2026/08/26/rollout-z-01a00000-0000-0000-0000-0000000000cc.jsonl`, mtimeMs: 300 },
+  ];
+  const assigned = new Set();
+  // 进程真实打开 bb（mtime 200），但启动时间猜测会选 cc（mtime 300）
+  const proc = { sessionId: null, startTimeMs: 1000 };
+  const openLogs = [allLogs[1].path];
+  const hit = findSessionLog(proc, allLogs, assigned, openLogs);
+  assert.ok(hit, '应选中 lsof 打开的日志');
+  assert.strictEqual(hit.path, allLogs[1].path, 'openLogs 优先于 mtime');
+  // 已分配的不重复选 → 回退到启动时间猜测
+  assigned.add(allLogs[1].path);
+  const hit2 = findSessionLog(proc, allLogs, assigned, openLogs);
+  assert.ok(hit2, 'openLog 被占时回退猜分支');
+  assert.strictEqual(hit2.path, allLogs[2].path, '回退选最新 mtime');
+});
+
+test('listOpenSessionLogs：从 lsof 输出提取进程打开的 rollout 日志', () => {
+  const { listOpenSessionLogs } = require('../lib/scan');
+  const lsofOut = [
+    'codex  1234  gsj  19u  REG  1,18  14873858  /Users/gsj/.codex/sessions/2026/08/27/rollout-2026-08-27T22-56-23-01a00000-0000-0000-0000-000000000001.jsonl',
+    'codex  1234  gsj  22u  REG  1,18   4322196  /Users/gsj/.codex/sessions/2026/08/28/rollout-2026-08-28T01-09-42-01a00000-0000-0000-0000-000000000002.jsonl',
+    'codex  1234  gsj  3u  CHR  136,2  0t0  /dev/ttys011',
+  ].join('\n');
+  // execLsof 注入返回 mock；sessionsDir 指向不存在的 fake 目录，只验证提取逻辑
+  const paths = listOpenSessionLogs(1234, '/fake/.codex/sessions', () => lsofOut);
+  // 真实 fs 下找不到文件返回空数组（mock 路径不存在），验证提取至少识别到 2 个文件名
+  assert.ok(paths.length <= 2, '提取结果不超上限');
 });

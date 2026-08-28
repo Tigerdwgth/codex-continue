@@ -14,10 +14,13 @@ codex 配套插件：**不依赖 tmux**，只要 codex 跑在终端里（普通�
 1. 每隔 `--interval` 秒（默认 5s）用 `ps -axo pid,lstart,tty,command` 找到所有
    交互式 codex 进程（裸 `codex` / `codex resume`，排除 code-mode-host、vscode、
    app-server 等后台变体），拿到进程的 tty；
-2. 对每个进程定位它在 `~/.codex/sessions/**/rollout-*.jsonl` 下的会话日志
-   （`codex resume <session-id>` 按 session id 精确匹配，普通 `codex` 按启动时间
-   匹配最近日志）；
-3. 只检测日志**新增长**部分的 429 / 容量错误（不区分大小写，滚动历史不重复触发）；
+2. 对每个进程定位它的会话日志：优先用 `lsof` 探测该进程**真实打开**的
+   `~/.codex/sessions/**/rollout-*.jsonl` 文件（`codex resume` 不带 session id 时会
+   同时打开多个历史会话日志，靠猜必然错配）；`codex resume <session-id>` 按 session
+   id 精确匹配，其余按启动时间匹配最近日志；
+3. 只检测日志**新增长**部分的 429 / 容量错误（不区分大小写，滚动历史不重复触发），
+   且只对「错误是最后一条、会话停住在错误上」的会话触发 —— 错误之后已有新活动
+   （已恢复）的不打扰；
 4. 命中后直接向该进程的终端设备（`/dev/<tty>`）分两次写入 `continue` 和回车
    —— 先写文本、稍等 300ms 再写回车（`\n`）。两个坑：
    - codex 的 TUI 会吞掉"紧跟文本的回车"（一次写入文本+回车时只输入不提交），
@@ -61,7 +64,7 @@ codex-continue --send continue   # 发送给 codex 的命令（默认 continue�
 
 ## 环境要求
 
-- codex 跑在终端里（有 tty）；本机有 `ps`、能读 `~/.codex/sessions`
+- codex 跑在终端里（有 tty）；本机有 `ps`、`lsof`、能读 `~/.codex/sessions`
 - 不依赖 tmux
 - macOS / Linux
 - Node.js >= 18
