@@ -190,14 +190,15 @@ test('scan：错误不再增长不重复触发；冷却内新错误也不触发'
   scanner.scan(); // 日志没变，不重复
   assert.strictEqual(writes.length, 2);
   // 日志增长出新错误（错误时间 BASE+70s）但距上次触发仅 15s（冷却内）→ 不触发，lastSize 前进
+  // mtime 保持 BASE（很老）：日志写完后停滞 = 卡住状态，STALE 判据不误伤
   const err2 = err1 + errLine(BASE + 70_000, 'model at capacity');
-  files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: BASE + 70_000 });
+  files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: BASE });
   t.value = BASE + 75_000;
   scanner.scan();
   assert.strictEqual(writes.length, 2, '冷却内不触发');
   // 冷却过后（距上次 90s）日志再出现新错误 → 触发
   const err3 = err2 + errLine(BASE + 140_000, 'exceeded retry limit, last status: 429 Too Many Requests, request id: zzz');
-  files.set(errLog, { size: Buffer.byteLength(err3), content: err3, mtimeMs: BASE + 140_000 });
+  files.set(errLog, { size: Buffer.byteLength(err3), content: err3, mtimeMs: BASE });
   t.value = BASE + 150_000;
   scanner.scan();
   assert.strictEqual(writes.length, 4, '冷却过后新错误触发');
@@ -441,11 +442,13 @@ test('findSessionLog：lsof 探测的 openLogs 优先于启动时间猜测', () 
   const hit = findSessionLog(proc, allLogs, assigned, openLogs);
   assert.ok(hit, '应选中 lsof 打开的日志');
   assert.strictEqual(hit.path, allLogs[1].path, 'openLogs 优先于 mtime');
-  // 已分配的不重复选 → 回退到启动时间猜测
+  // 即使 assigned 里有它（被别的进程猜分支抢占过），lsof 硬证据仍要还给本进程
   assigned.add(allLogs[1].path);
   const hit2 = findSessionLog(proc, allLogs, assigned, openLogs);
-  assert.ok(hit2, 'openLog 被占时回退猜分支');
-  assert.strictEqual(hit2.path, allLogs[2].path, '回退选最新 mtime');
+  assert.strictEqual(hit2.path, allLogs[1].path, 'lsof 硬证据无视 assigned');
+  // 无 openLogs 时才回退猜分支，且跳过已 assigned 的
+  const hit3 = findSessionLog({ sessionId: null, startTimeMs: 1000 }, allLogs, new Set([allLogs[2].path]), []);
+  assert.strictEqual(hit3.path, allLogs[1].path, '猜分支跳过已分配、选次新');
 });
 
 test('listOpenSessionLogs：从 lsof 输出提取进程打开的 rollout 日志', () => {
@@ -459,4 +462,23 @@ test('listOpenSessionLogs：从 lsof 输出提取进程打开的 rollout 日志'
   const paths = listOpenSessionLogs(1234, '/fake/.codex/sessions', () => lsofOut);
   // 真实 fs 下找不到文件返回空数组（mock 路径不存在），验证提取至少识别到 2 个文件名
   assert.ok(paths.length <= 2, '提取结果不超上限');
+});
+
+test('scan：日志活跃（mtime 新鲜，codex 在写）→ 即使有 429 也不触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: Buffer.byteLength(errLine(BASE)), content: errLine(BASE), mtimeMs: BASE });
+
+  const writes = [];
+  const scanner = createScanner({ execTmux: () => '',
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE + 5_000, // 距 mtime 仅 5s → 日志仍在写（活跃）
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 0, '活跃中的会话（日志在写）不触发');
+  assert.strictEqual(writes.length, 0);
 });
