@@ -537,3 +537,40 @@ test('scan：当前屏幕无 429（仅历史残留）→ 不触发', () => {
   assert.strictEqual(scanner.scan(), 0, '当前屏无 429 不触发');
   assert.strictEqual(sends.length, 0, '不发 continue');
 });
+
+test('scan：发送后屏幕 429 仍在 → 同一卡住事件不重发，进入静默', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: 0, content: '', mtimeMs: BASE });
+
+  const sends = [];
+  const t = { value: BASE + 600_000 };
+  let paneState = '429'; // 初始屏幕显示 429
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      if (args[0] === 'capture-pane') return paneState === '429' ? '\n■ exceeded retry limit, last status: 429 Too Many Requests\n' : '\n» Ask Codex\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => t.value,
+    cooldownMs: 30000,
+    verifyWindow: 15_000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  // 第一轮：屏幕 429 → 触发一次
+  assert.strictEqual(scanner.scan(), 1, '首次触发');
+  assert.strictEqual(sends.length, 2);
+  // 后续多轮：屏幕 429 仍在但 continue 未生效 → 不再重发（静默）
+  t.value += 40_000;
+  assert.strictEqual(scanner.scan(), 0, '同一卡住事件不重发');
+  assert.strictEqual(sends.length, 2, 'continue 数量不变');
+  // 屏幕 429 消失（恢复）→ 解除静默，恢复正常监听
+  paneState = 'ok';
+  t.value += 60_000;
+  assert.strictEqual(scanner.scan(), 0, '恢复后不触发（无 429）');
+});
