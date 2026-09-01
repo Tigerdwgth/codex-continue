@@ -510,3 +510,30 @@ test('scan：tmux 屏幕实时显示 429（日志无记录）→ 触发', () => 
   assert.ok(sends[0].includes('continue'), '发 continue');
   assert.ok(sends[1].includes('Enter'), '发 Enter');
 });
+
+test('scan：当前屏幕无 429（仅历史残留）→ 不触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  // 日志无 429，无错误
+  files.set(errLog, { size: Buffer.byteLength('{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n'), content: '{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n', mtimeMs: BASE });
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      // capture-pane 只返回当前屏：无 429（会话已恢复）
+      if (args[0] === 'capture-pane') return '\n» Ask Codex to do anything\n  gpt-5.6-sol ultra · ~\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE + 600_000,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 0, '当前屏无 429 不触发');
+  assert.strictEqual(sends.length, 0, '不发 continue');
+});
