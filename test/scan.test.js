@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const {
-  createScanner, listCodexProcesses, findSessionLog, detectError, parseLstart, listTmuxPaneTargets,
+  createScanner, listCodexProcesses, findSessionLog, detectError, parseLstart, listTmuxPaneTargets, sendContinue,
 } = require('../lib/scan');
 
 const PS_SAMPLE = `  PID LSTART TTY  COMMAND
@@ -137,7 +137,7 @@ test('scan 全流程：日志有 429 错误 → 写 tty continue + \\n', () => {
   assert.strictEqual(writes[1].data, '\n');
 });
 
-test('scan：历史错误（已停住）也触发 —— 移除时间窗口后只要有错误就发', () => {
+test('scan：历史错误（超过 3 分钟）不触发 —— 避免历史残留反复误发', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
   const ERR_TS = new Date(2026, 7, 26, 11, 30, 0).getTime();
@@ -146,14 +146,14 @@ test('scan：历史错误（已停住）也触发 —— 移除时间窗口后�
   const writes = [];
   const scanner = createScanner({ execTmux: () => '',
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
-    now: () => ERR_TS + 20 * 60_000, // 错误后 20 分钟（远超原 10 分钟窗口）
+    now: () => ERR_TS + 20 * 60_000, // 错误后 20 分钟（远超 3 分钟窗口）
     cooldownMs: 30000,
     enterDelayMs: 0,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
   });
-  assert.strictEqual(scanner.scan(), 1, '历史错误同样触发');
-  assert.strictEqual(writes.length, 2);
+  assert.strictEqual(scanner.scan(), 0, '历史错误不触发');
+  assert.strictEqual(writes.length, 0);
 });
 
 test('scan：日志无错误时不触发', () => {
@@ -573,4 +573,112 @@ test('scan：发送后屏幕 429 仍在 → 同一卡住事件不重发，进入
   paneState = 'ok';
   t.value += 60_000;
   assert.strictEqual(scanner.scan(), 0, '恢复后不触发（无 429）');
+});
+
+test('scan：日志 429 是历史 + 屏幕实时有 429 → 屏幕兜底触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  // 日志里的 429 是 20 分钟前的历史（超 3 分钟窗口）
+  files.set(errLog, { size: Buffer.byteLength(errLine(BASE)), content: errLine(BASE), mtimeMs: BASE });
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      if (args[0] === 'capture-pane') return '\n■ exceeded retry limit, last status: 429 Too Many Requests\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE + 20 * 60_000, // 日志 429 是 20 分钟前
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1, '屏幕实时 429 兜底触发');
+  assert.strictEqual(sends.length, 2);
+});
+
+test('scan：屏幕有 429 但日志在写（mtime 新鲜=codex 已恢复干活）→ 不触发', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  // 日志 mtime 新鲜（5 秒前 = codex 正在写日志干活）
+  files.set(errLog, { size: Buffer.byteLength('{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n'), content: '{"timestamp":"' + new Date(BASE).toISOString() + '","payload":{"type":"task_complete"}}\n', mtimeMs: BASE });
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      // 屏幕残留 429（codex 恢复后 TUI 错误行没清）
+      if (args[0] === 'capture-pane') return '\n■ exceeded retry limit, last status: 429 Too Many Requests\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE + 5_000, // 距 mtime 5s → 日志活跃
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 0, '屏幕 429 残留但日志在写 → 不触发');
+  assert.strictEqual(sends.length, 0, '不发 continue');
+});
+
+test('scan：屏幕显示 403 错误 → 触发 continue', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: 0, content: '', mtimeMs: BASE - 120_000 }); // 日志停滞
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      if (args[0] === 'capture-pane') return '\n■ 403 Forbidden: 请求被拒绝\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1, '屏幕 403 触发');
+  assert.strictEqual(sends.length, 2);
+});
+
+test('MATCHERS：base64/路径里的 403 不误匹配', () => {
+  const { MATCHERS } = require('../lib/scan');
+  const base64 = 'x403J2RN3iDw7ev/blqtvDe3TXNxDGHDllZXHdnNrtxk';
+  const path = '/tmp/robodojo-mem-20260901-183526-retry2/';
+  const normal = '» Ask Codex to do anything';
+  assert.ok(!MATCHERS.some(re => re.test(base64)), 'base64 403 不匹配');
+  assert.ok(!MATCHERS.some(re => re.test(path)), '路径 403 不匹配');
+  assert.ok(!MATCHERS.some(re => re.test(normal)), '正常屏不匹配');
+  assert.ok(MATCHERS.some(re => re.test('403 Forbidden')), '403 Forbidden 匹配');
+});
+
+test('sendContinue：首 Enter 未提交（continue 残留输入框）→ 补发 Enter', () => {
+  const cmds = [];
+  let enterCount = 0;
+  const run = (args) => {
+    cmds.push(args.join(' '));
+    if (args[0] === 'capture-pane') {
+      // 首个 Enter 被当换行，continue 残留；第二次 Enter 后才提交清除
+      return enterCount >= 2 ? '» Ask Codex to do anything' : '» continue';
+    }
+    if (args[0] === 'send-keys' && args[args.length - 1] === 'Enter') enterCount++;
+    return '';
+  };
+  sendContinue({ tty: 'ttys099', tmuxTarget: 'x:0.0' }, 'continue', 0, {
+    sendTmux: run, onTrigger: () => {},
+  });
+  const enterCount2 = cmds.filter((c) => c.endsWith('Enter')).length;
+  assert.strictEqual(enterCount2, 2, '首 Enter 未提交时补发第二次 Enter');
 });
