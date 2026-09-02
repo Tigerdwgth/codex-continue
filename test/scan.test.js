@@ -168,7 +168,7 @@ test('scan：日志无错误时不触发', () => {
   assert.strictEqual(writes.length, 0);
 });
 
-test('scan：错误不再增长不重复触发；冷却内新错误也不触发', () => {
+test('scan：错误不再增长不重复触发；发送后冷静期内也不重发', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
   const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
@@ -181,27 +181,27 @@ test('scan：错误不再增长不重复触发；冷却内新错误也不触发'
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => t.value,
     cooldownMs: 30000,
+    silence: 120_000, // 冷静期 2 分钟
     enterDelayMs: 0,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
   });
-  scanner.scan(); // 触发，lastAt = BASE+60s
+  scanner.scan(); // 触发，进入冷静期（到 BASE+60s+120s=BASE+180s）
   assert.strictEqual(writes.length, 2);
-  scanner.scan(); // 日志没变，不重复
+  scanner.scan(); // 日志没变，冷静期内不重复
   assert.strictEqual(writes.length, 2);
-  // 日志增长出新错误（错误时间 BASE+70s）但距上次触发仅 15s（冷却内）→ 不触发，lastSize 前进
-  // mtime 保持 BASE（很老）：日志写完后停滞 = 卡住状态，STALE 判据不误伤
+  // 日志增长出新错误，但仍在冷静期（BASE+75s < 180s）→ 不触发
   const err2 = err1 + errLine(BASE + 70_000, 'model at capacity');
   files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: BASE });
   t.value = BASE + 75_000;
   scanner.scan();
-  assert.strictEqual(writes.length, 2, '冷却内不触发');
-  // 冷却过后（距上次 90s）日志再出现新错误 → 触发
-  const err3 = err2 + errLine(BASE + 140_000, 'exceeded retry limit, last status: 429 Too Many Requests, request id: zzz');
+  assert.strictEqual(writes.length, 2, '冷静期内不触发');
+  // 冷静期过后（t > BASE+180s）日志再出现新错误 → 触发
+  const err3 = err2 + errLine(BASE + 240_000, 'exceeded retry limit, last status: 429 Too Many Requests, request id: zzz');
   files.set(errLog, { size: Buffer.byteLength(err3), content: err3, mtimeMs: BASE });
-  t.value = BASE + 150_000;
+  t.value = BASE + 250_000;
   scanner.scan();
-  assert.strictEqual(writes.length, 4, '冷却过后新错误触发');
+  assert.strictEqual(writes.length, 4, '冷静期过后新错误触发');
 });
 
 test('scan：发送后日志增长（codex 响应）→ 正常，不静默', () => {
@@ -236,7 +236,7 @@ test('scan：发送后日志增长（codex 响应）→ 正常，不静默', () 
   assert.strictEqual(writes.length, 2);
 });
 
-test('scan：发送后日志不增长（codex 冻结/无响应）→ 静默跳过，不再发', () => {
+test('scan：发送后进入冷静期，同一次 429 不重复发', () => {
   const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
   const errLog = `${ROOT}/2026/08/26/c.jsonl`;
   const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
@@ -249,24 +249,23 @@ test('scan：发送后日志不增长（codex 冻结/无响应）→ 静默跳�
     execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
     now: () => t.value,
     cooldownMs: 30000,
-    enterDelayMs: 0,
-    verifyWindow: 15_000,
     silence: 60_000,
+    enterDelayMs: 0,
     sessionsDir: '/fake/.codex/sessions',
     io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
   });
-  scanner.scan(); // 触发，进入验证
+  scanner.scan(); // 触发，冷静期到 BASE+60s+60s=BASE+120s
   assert.strictEqual(writes.length, 2);
-  // 日志没增长，过了验证窗口 → 冻结静默
-  t.value = BASE + 90_000; // 发送后 30s > 验证窗口 15s
+  // 日志没增长，冷静期内 → 不重复发
+  t.value = BASE + 90_000; // 发送后 30s，冷静期内
   scanner.scan();
-  assert.strictEqual(writes.length, 2, '静默后不重复发');
-  // 静默期内即使有新错误也不发
+  assert.strictEqual(writes.length, 2, '冷静期内不重复发');
+  // 冷静期内即使有新错误也不发
   const err2 = err1 + errLine(BASE + 100_000, 'exceeded retry limit, last status: 429 Too Many Requests, request id: x');
-  files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: BASE + 100_000 });
-  t.value = BASE + 120_000; // 静默期内（60s 静默从 BASE+90s 开始）
+  files.set(errLog, { size: Buffer.byteLength(err2), content: err2, mtimeMs: BASE });
+  t.value = BASE + 110_000; // 冷静期内（冷静到 BASE+120s）
   scanner.scan();
-  assert.strictEqual(writes.length, 2, '静默期内不发');
+  assert.strictEqual(writes.length, 2, '冷静期内不发');
 });
 
 test('listTmuxPaneTargets 解析 pane_tty → target 映射', () => {
