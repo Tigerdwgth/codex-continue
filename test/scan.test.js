@@ -652,7 +652,7 @@ test('scan：屏幕显示 403 错误 → 触发 continue', () => {
   assert.strictEqual(sends.length, 2);
 });
 
-test('MATCHERS：base64/路径里的 403 不误匹配', () => {
+ test('MATCHERS：base64/路径里的 403 不误匹配', () => {
   const { MATCHERS } = require('../lib/scan');
   const base64 = 'x403J2RN3iDw7ev/blqtvDe3TXNxDGHDllZXHdnNrtxk';
   const path = '/tmp/robodojo-mem-20260901-183526-retry2/';
@@ -661,6 +661,34 @@ test('MATCHERS：base64/路径里的 403 不误匹配', () => {
   assert.ok(!MATCHERS.some(re => re.test(path)), '路径 403 不匹配');
   assert.ok(!MATCHERS.some(re => re.test(normal)), '正常屏不匹配');
   assert.ok(MATCHERS.some(re => re.test('403 Forbidden')), '403 Forbidden 匹配');
+  assert.ok(MATCHERS.some(re => re.test('unexpected status 404 Not Found: ""')), '404 Not Found 匹配');
+  assert.ok(MATCHERS.some(re => re.test('404 Not Found')), '独立 404 Not Found 匹配');
+  assert.ok(!MATCHERS.some(re => re.test('file_404.png')), '路径 404 不匹配');
+});
+
+test('scan：屏幕显示 404 Not Found 错误 → 触发 continue', () => {
+  const { readdirSync, statSync, readFileSync, files, ROOT } = makeDirTree();
+  const errLog = `${ROOT}/2026/08/26/c.jsonl`;
+  const BASE = new Date(2026, 7, 26, 11, 30, 0).getTime();
+  files.set(errLog, { size: 0, content: '', mtimeMs: BASE - 120_000 }); // 日志停滞
+
+  const sends = [];
+  const scanner = createScanner({
+    execTmux: (args) => {
+      if (args[0] === 'list-panes') return '/dev/ttys011\tcodex:0.0\n';
+      if (args[0] === 'capture-pane') return '\n■ unexpected status 404 Not Found: "", url: http://api.hexafuture.cn/openai/v1/responses\n';
+      if (args[0] === 'send-keys') sends.push(args.slice(1).join(' '));
+      return '';
+    },
+    execPs: () => ` 1000 Wed Aug 26 11:00:00 2026 ttys011 codex\n`,
+    now: () => BASE,
+    cooldownMs: 30000,
+    enterDelayMs: 0,
+    sessionsDir: '/fake/.codex/sessions',
+    io: { readdirSync, statSync, readFileSync, writeFileSync: (d, x) => writes.push(x) },
+  });
+  assert.strictEqual(scanner.scan(), 1, '屏幕 404 触发');
+  assert.strictEqual(sends.length, 2);
 });
 
 test('sendContinue：首 Enter 未提交（continue 残留输入框）→ 补发 Enter', () => {
